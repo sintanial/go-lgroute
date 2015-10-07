@@ -8,85 +8,147 @@ import (
 	"log"
 	"bytes"
 	"io"
+	"fmt"
+	"flag"
 )
 
-type RouterKey struct {
+var stderr *log.Logger
+
+func init() {
+	stderr = log.New(os.Stderr, "", 0)
+}
+
+
+type Router struct {
 	Key  []byte
 	File *os.File
+	flag int
 }
 
-func (rk *RouterKey) Write(data []byte) (n int, err error) {
-	return rk.File.Write(data)
+func (r *Router) Write(data []byte) (n int, err error) {
+	data = append(data, []byte("\r\n")...)
+	return r.File.Write(data)
 }
 
-func (rk *RouterKey) Contains(s []byte) bool {
-	return bytes.Contains(s, rk.Key)
+func (r *Router) Contains(s []byte) bool {
+	return bytes.Contains(s, r.Key)
 }
 
-func (rk *RouterKey) ContainsAndWrite(s []byte) (err error) {
-	if rk.Contains(s) {
-		s = append(s, []byte("\r\n")...)
-		_, err = rk.Write(s)
+func (r *Router) String() string {
+	var s string
+	if r.flag == os.O_APPEND {
+		s = ">>"
+	} else {
+		s = ">"
 	}
 
-	return err
+	return "router: " + string(r.Key) + s + r.File.Name()
 }
 
-func ParseRouter(arg string) (router *RouterKey, err error) {
-	var data []string
+func NewRouter(arg string) (router *Router, err error) {
+	var params []string
 	var flag int
 	if strings.Contains(arg, ">>") {
-		data = strings.Split(arg, ">>")
+		params = strings.Split(arg, ">>")
 		flag = os.O_APPEND
 	} else if strings.Contains(arg, ">") {
-		data = strings.Split(arg, ">")
+		params = strings.Split(arg, ">")
 		flag = os.O_TRUNC
+	} else {
+		return nil, errors.New(`invalid rediraction symbol in argument "` + arg + `"`)
 	}
 
 
-	if len(data) < 2 {
-		return nil, errors.New(`invalid argument format "` + arg + `"`)
+	if len(params) < 2 {
+		return nil, errors.New(`invalid argument "` + arg + `"`)
 	}
 
-	file, err := os.OpenFile(data[1], os.O_WRONLY | os.O_CREATE | flag, 0644)
+	file, err := os.OpenFile(params[1], os.O_WRONLY | os.O_CREATE | flag, 0644)
 	if err != nil {
 		return nil, err
 	}
 
-	return &RouterKey{[]byte(data[0]), file}, nil
+	return &Router{[]byte(params[0]), file, flag}, nil
 }
 
 
-func main() {
-	args := os.Args[1:len(os.Args)]
+type Routers struct {
+	Routers    []*Router
+	InParallel bool
+}
 
-	stderr := log.New(os.Stderr, "", 0)
+func (r *Routers) handle(line []byte) {
+	contained := false
+	for _, router := range r.Routers {
+		if router.Contains(line) {
+			if _, err := router.Write(line); err != nil {
+				stderr.Println(err.Error())
+			} else {
+				contained = true
+			}
+		}
+	}
 
-	keys := make([]*RouterKey, 0)
+	if contained != true {
+		fmt.Println(string(line))
+	}
+}
+
+func (r *Routers) Handle(line []byte) {
+	if r.InParallel {
+		go r.handle(line)
+	} else {
+		r.handle(line)
+	}
+}
+
+func NewRouters(args []string) *Routers {
+	var routers []*Router
 	for _, arg := range args {
-		router, err := ParseRouter(arg)
+		router, err := NewRouter(arg)
 		if err != nil {
-			stderr.Println(err, router)
+			stderr.Println(err.Error())
 			continue
 		}
-		keys = append(keys, router)
+		routers = append(routers, router)
 	}
+
+	return &Routers{
+		Routers: routers,
+	}
+}
+
+func CanonicalArgs(args []string) []string {
+	var result []string
+	for _, arg := range args {
+		if string(arg[0]) != "-" {
+			result = append(result, arg)
+		}
+	}
+
+	return result
+}
+
+func main() {
+	inparallel := flag.Bool("p", false, "Run in parallel")
+	flag.Parse()
+
+	args := CanonicalArgs(os.Args[1:len(os.Args)])
+
+	routers := NewRouters(args)
+	routers.InParallel = *inparallel
 
 	bf := bufio.NewReader(os.Stdin)
 	for {
 		line, _, err := bf.ReadLine()
 
-		for _, router := range keys {
-			if err := router.ContainsAndWrite(line); err != nil {
-				stderr.Println(err)
-			}
-		}
-
 		if err != nil {
 			if err != io.EOF {
-				stderr.Println(err)
+				stderr.Println(err.Error())
 			}
 			break
 		}
+
+		routers.Handle(line)
 	}
 }
